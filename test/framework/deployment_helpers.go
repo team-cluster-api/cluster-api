@@ -42,16 +42,14 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	utilversion "k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/ptr"
 	toolscache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	. "sigs.k8s.io/cluster-api/test/framework/ginkgoextensions"
 	"sigs.k8s.io/cluster-api/test/framework/internal/log"
@@ -493,16 +491,22 @@ func WaitForDNSUpgrade(ctx context.Context, input WaitForDNSUpgradeInput, interv
 type DeployUnevictablePodInput struct {
 	WorkloadClusterProxy ClusterProxy
 	ControlPlane         *controlplanev1.KubeadmControlPlane
+	MachineDeployment    *clusterv1.MachineDeployment
 	DeploymentName       string
 	Namespace            string
+	NodeSelector         map[string]string
 
 	WaitForDeploymentAvailableInterval []interface{}
 }
 
+// DeployUnevictablePod will deploy a Deployment on a ControlPlane or MachineDeployment.
+// It will deploy one Pod replica to each Machine and then deploy a PDB to ensure none of the Pods can be evicted.
 func DeployUnevictablePod(ctx context.Context, input DeployUnevictablePodInput) {
 	Expect(input.DeploymentName).ToNot(BeNil(), "Need a deployment name in DeployUnevictablePod")
 	Expect(input.Namespace).ToNot(BeNil(), "Need a namespace in DeployUnevictablePod")
 	Expect(input.WorkloadClusterProxy).ToNot(BeNil(), "Need a workloadClusterProxy in DeployUnevictablePod")
+	Expect((input.MachineDeployment == nil && input.ControlPlane != nil) ||
+		(input.MachineDeployment != nil && input.ControlPlane == nil)).To(BeTrue(), "Either MachineDeployment or ControlPlane must be set in DeployUnevictablePod")
 
 	EnsureNamespace(ctx, input.WorkloadClusterProxy.GetClient(), input.Namespace)
 
@@ -512,16 +516,17 @@ func DeployUnevictablePod(ctx context.Context, input DeployUnevictablePodInput) 
 			Namespace: input.Namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To[int32](4),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app": "nonstop",
+					"app":        "nonstop",
+					"deployment": input.DeploymentName,
 				},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app": "nonstop",
+						"app":        "nonstop",
+						"deployment": input.DeploymentName,
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -531,6 +536,25 @@ func DeployUnevictablePod(ctx context.Context, input DeployUnevictablePodInput) 
 							Image: "registry.k8s.io/pause:3.10",
 						},
 					},
+					Affinity: &corev1.Affinity{
+						// Make sure only 1 Pod of this Deployment can run on the same Node.
+						PodAntiAffinity: &corev1.PodAntiAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchExpressions: []metav1.LabelSelectorRequirement{
+											{
+												Key:      "deployment",
+												Operator: "In",
+												Values:   []string{input.DeploymentName},
+											},
+										},
+									},
+									TopologyKey: "kubernetes.io/hostname",
+								},
+							},
+						},
+					},
 				},
 			},
 		},
@@ -538,31 +562,24 @@ func DeployUnevictablePod(ctx context.Context, input DeployUnevictablePodInput) 
 	workloadClient := input.WorkloadClusterProxy.GetClientSet()
 
 	if input.ControlPlane != nil {
-		var serverVersion *version.Info
-		Eventually(func() error {
-			var err error
-			serverVersion, err = workloadClient.ServerVersion()
-			return err
-		}, retryableOperationTimeout, retryableOperationInterval).Should(Succeed(), "failed to get server version")
-
-		// Use the control-plane label for Kubernetes version >= v1.20.0.
-		if utilversion.MustParseGeneric(serverVersion.String()).AtLeast(utilversion.MustParseGeneric("v1.20.0")) {
-			workloadDeployment.Spec.Template.Spec.NodeSelector = map[string]string{nodeRoleControlPlane: ""}
-		} else {
-			workloadDeployment.Spec.Template.Spec.NodeSelector = map[string]string{nodeRoleOldControlPlane: ""}
-		}
-
+		workloadDeployment.Spec.Template.Spec.NodeSelector = map[string]string{nodeRoleControlPlane: ""}
 		workloadDeployment.Spec.Template.Spec.Tolerations = []corev1.Toleration{
-			{
-				Key:    nodeRoleOldControlPlane,
-				Effect: "NoSchedule",
-			},
 			{
 				Key:    nodeRoleControlPlane,
 				Effect: "NoSchedule",
 			},
 		}
+		workloadDeployment.Spec.Replicas = input.ControlPlane.Spec.Replicas
 	}
+	if input.MachineDeployment != nil {
+		workloadDeployment.Spec.Replicas = input.MachineDeployment.Spec.Replicas
+	}
+
+	// Note: If set, the NodeSelector field overwrites the NodeSelector we set above for control plane nodes.
+	if input.NodeSelector != nil {
+		workloadDeployment.Spec.Template.Spec.NodeSelector = input.NodeSelector
+	}
+
 	AddDeploymentToWorkloadCluster(ctx, AddDeploymentToWorkloadClusterInput{
 		Namespace:  input.Namespace,
 		ClientSet:  workloadClient,
@@ -570,10 +587,6 @@ func DeployUnevictablePod(ctx context.Context, input DeployUnevictablePodInput) 
 	})
 
 	budget := &policyv1.PodDisruptionBudget{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "PodDisruptionBudget",
-			APIVersion: "policy/v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      input.DeploymentName,
 			Namespace: input.Namespace,
@@ -581,13 +594,14 @@ func DeployUnevictablePod(ctx context.Context, input DeployUnevictablePodInput) 
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app": "nonstop",
+					"app":        "nonstop",
+					"deployment": input.DeploymentName,
 				},
 			},
+			// Setting MaxUnavailable to 0 means no Pods can be evicted / unavailable.
 			MaxUnavailable: &intstr.IntOrString{
 				Type:   intstr.Int,
-				IntVal: 1,
-				StrVal: "1",
+				IntVal: 0,
 			},
 		},
 	}

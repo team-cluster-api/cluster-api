@@ -30,10 +30,10 @@ import (
 	"k8s.io/utils/ptr"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	controlplanev1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
 	"sigs.k8s.io/cluster-api/test/framework"
 	"sigs.k8s.io/cluster-api/test/framework/clusterctl"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/conditions"
 )
 
 // NodeDrainTimeoutSpecInput is the input for NodeDrainTimeoutSpec.
@@ -52,10 +52,8 @@ type NodeDrainTimeoutSpecInput struct {
 	// able to identify the default.
 	InfrastructureProvider *string
 
-	// Flavor, if specified, must refer to a template that contains
-	// a KubeadmControlPlane resource with spec.machineTemplate.nodeDrainTimeout
-	// configured and a MachineDeployment resource that has
-	// spec.template.spec.nodeDrainTimeout configured.
+	// Flavor, if specified, must refer to a template that uses a Cluster with ClusterClass.
+	// The cluster must use a KubeadmControlPlane and a MachineDeployment.
 	// If not specified, "node-drain" is used.
 	Flavor *string
 
@@ -66,13 +64,11 @@ type NodeDrainTimeoutSpecInput struct {
 
 func NodeDrainTimeoutSpec(ctx context.Context, inputGetter func() NodeDrainTimeoutSpecInput) {
 	var (
-		specName           = "node-drain"
-		input              NodeDrainTimeoutSpecInput
-		namespace          *corev1.Namespace
-		cancelWatches      context.CancelFunc
-		clusterResources   *clusterctl.ApplyClusterTemplateAndWaitResult
-		machineDeployments []*clusterv1.MachineDeployment
-		controlplane       *controlplanev1.KubeadmControlPlane
+		specName         = "node-drain"
+		input            NodeDrainTimeoutSpecInput
+		namespace        *corev1.Namespace
+		cancelWatches    context.CancelFunc
+		clusterResources *clusterctl.ApplyClusterTemplateAndWaitResult
 	)
 
 	BeforeEach(func() {
@@ -97,6 +93,7 @@ func NodeDrainTimeoutSpec(ctx context.Context, inputGetter func() NodeDrainTimeo
 		if input.InfrastructureProvider != nil {
 			infrastructureProvider = *input.InfrastructureProvider
 		}
+
 		controlPlaneReplicas := 3
 		clusterctl.ApplyClusterTemplateAndWait(ctx, clusterctl.ApplyClusterTemplateAndWaitInput{
 			ClusterProxy: input.BootstrapClusterProxy,
@@ -118,51 +115,166 @@ func NodeDrainTimeoutSpec(ctx context.Context, inputGetter func() NodeDrainTimeo
 			WaitForMachineDeployments:    input.E2EConfig.GetIntervals(specName, "wait-worker-nodes"),
 		}, clusterResources)
 		cluster := clusterResources.Cluster
-		controlplane = clusterResources.ControlPlane
-		machineDeployments = clusterResources.MachineDeployments
+		controlplane := clusterResources.ControlPlane
+		machineDeployments := clusterResources.MachineDeployments
 		Expect(machineDeployments[0].Spec.Replicas).To(Equal(ptr.To[int32](1)))
 
-		By("Add a deployment with unevictable pods and podDisruptionBudget to the workload cluster. The deployed pods cannot be evicted in the node draining process.")
-		workloadClusterProxy := input.BootstrapClusterProxy.GetWorkloadCluster(ctx, cluster.Namespace, cluster.Name)
-		framework.DeployUnevictablePod(ctx, framework.DeployUnevictablePodInput{
-			WorkloadClusterProxy:               workloadClusterProxy,
-			DeploymentName:                     fmt.Sprintf("%s-%s", "unevictable-pod", util.RandomString(3)),
-			Namespace:                          namespace.Name + "-unevictable-workload",
-			WaitForDeploymentAvailableInterval: input.E2EConfig.GetIntervals(specName, "wait-deployment-available"),
+		// This label will be added to all Machines so we can later create the unevictable Pods on the right Nodes.
+		nodeOwnerLabelKey := "owner.node.cluster.x-k8s.io"
+
+		By("Ensure Node label is set & NodeDrainTimeout is set to 0 (wait forever) on ControlPlane and MachineDeployment topologies")
+		modifyControlPlaneViaClusterAndWait(ctx, modifyControlPlaneViaClusterAndWaitInput{
+			ClusterProxy: input.BootstrapClusterProxy,
+			Cluster:      cluster,
+			ModifyControlPlaneTopology: func(topology *clusterv1.ControlPlaneTopology) {
+				topology.NodeDrainTimeout = &metav1.Duration{Duration: time.Duration(0)}
+				if topology.Metadata.Labels == nil {
+					topology.Metadata.Labels = map[string]string{}
+				}
+				topology.Metadata.Labels[nodeOwnerLabelKey] = "KubeadmControlPlane-" + controlplane.Name
+			},
+			WaitForControlPlane: input.E2EConfig.GetIntervals(specName, "wait-control-plane"),
+		})
+		modifyMachineDeploymentViaClusterAndWait(ctx, modifyMachineDeploymentViaClusterAndWaitInput{
+			ClusterProxy: input.BootstrapClusterProxy,
+			Cluster:      cluster,
+			ModifyMachineDeploymentTopology: func(topology *clusterv1.MachineDeploymentTopology) {
+				topology.NodeDrainTimeout = &metav1.Duration{Duration: time.Duration(0)}
+				if topology.Metadata.Labels == nil {
+					topology.Metadata.Labels = map[string]string{}
+				}
+				for _, md := range machineDeployments {
+					if md.Labels[clusterv1.ClusterTopologyMachineDeploymentNameLabel] == topology.Name {
+						topology.Metadata.Labels[nodeOwnerLabelKey] = "MachineDeployment-" + md.Name
+					}
+				}
+			},
+			WaitForMachineDeployments: input.E2EConfig.GetIntervals(specName, "wait-worker-nodes"),
 		})
 
-		By("Scale the machinedeployment down to zero. If we didn't have the NodeDrainTimeout duration, the node drain process would block this operator.")
-		// Because all the machines of a machinedeployment can be deleted at the same time, so we only prepare the interval for 1 replica.
-		nodeDrainTimeoutMachineDeploymentInterval := getDrainAndDeleteInterval(input.E2EConfig.GetIntervals(specName, "wait-machine-deleted"), machineDeployments[0].Spec.Template.Spec.NodeDrainTimeout, 1)
-		for _, md := range machineDeployments {
-			framework.ScaleAndWaitMachineDeployment(ctx, framework.ScaleAndWaitMachineDeploymentInput{
-				ClusterProxy:              input.BootstrapClusterProxy,
-				Cluster:                   cluster,
-				MachineDeployment:         md,
-				WaitForMachineDeployments: nodeDrainTimeoutMachineDeploymentInterval,
-				Replicas:                  0,
-			})
-		}
+		workloadClusterProxy := input.BootstrapClusterProxy.GetWorkloadCluster(ctx, cluster.Namespace, cluster.Name)
+		By("Deploy Deployment with unevictable Pods on control plane Nodes.")
 
-		By("Deploy deployment with unevictable pods on control plane nodes.")
+		cpDeploymentAndPDBName := fmt.Sprintf("%s-%s", "unevictable-pod-cp", util.RandomString(3))
 		framework.DeployUnevictablePod(ctx, framework.DeployUnevictablePodInput{
 			WorkloadClusterProxy:               workloadClusterProxy,
 			ControlPlane:                       controlplane,
-			DeploymentName:                     fmt.Sprintf("%s-%s", "unevictable-pod", util.RandomString(3)),
+			DeploymentName:                     cpDeploymentAndPDBName,
 			Namespace:                          namespace.Name + "-unevictable-workload",
+			NodeSelector:                       map[string]string{nodeOwnerLabelKey: "KubeadmControlPlane-" + controlplane.Name},
 			WaitForDeploymentAvailableInterval: input.E2EConfig.GetIntervals(specName, "wait-deployment-available"),
 		})
+		By("Deploy Deployment with unevictable Pods on MachineDeployment Nodes.")
+		mdDeploymentAndPDBNames := map[string]string{}
+		for _, md := range machineDeployments {
+			mdDeploymentAndPDBNames[md.Name] = fmt.Sprintf("%s-%s", "unevictable-pod-md", util.RandomString(3))
+			framework.DeployUnevictablePod(ctx, framework.DeployUnevictablePodInput{
+				WorkloadClusterProxy:               workloadClusterProxy,
+				MachineDeployment:                  md,
+				DeploymentName:                     mdDeploymentAndPDBNames[md.Name],
+				Namespace:                          namespace.Name + "-unevictable-workload",
+				NodeSelector:                       map[string]string{nodeOwnerLabelKey: "MachineDeployment-" + md.Name},
+				WaitForDeploymentAvailableInterval: input.E2EConfig.GetIntervals(specName, "wait-deployment-available"),
+			})
+		}
 
-		By("Scale down the controlplane of the workload cluster and make sure that nodes running workload can be deleted even the draining process is blocked.")
-		// When we scale down the KCP, controlplane machines are by default deleted one by one, so it requires more time.
-		nodeDrainTimeoutKCPInterval := getDrainAndDeleteInterval(input.E2EConfig.GetIntervals(specName, "wait-machine-deleted"), controlplane.Spec.MachineTemplate.NodeDrainTimeout, controlPlaneReplicas)
-		framework.ScaleAndWaitControlPlane(ctx, framework.ScaleAndWaitControlPlaneInput{
-			ClusterProxy:        input.BootstrapClusterProxy,
-			Cluster:             cluster,
-			ControlPlane:        controlplane,
-			Replicas:            1,
-			WaitForControlPlane: nodeDrainTimeoutKCPInterval,
+		By("Scale down the control plane to 1 and MachineDeployments to 0.")
+		modifyControlPlaneViaClusterAndWait(ctx, modifyControlPlaneViaClusterAndWaitInput{
+			ClusterProxy: input.BootstrapClusterProxy,
+			Cluster:      cluster,
+			ModifyControlPlaneTopology: func(topology *clusterv1.ControlPlaneTopology) {
+				topology.Replicas = ptr.To[int32](1)
+			},
+			WaitForControlPlane: input.E2EConfig.GetIntervals(specName, "wait-control-plane"),
 		})
+		modifyMachineDeploymentViaClusterAndWait(ctx, modifyMachineDeploymentViaClusterAndWaitInput{
+			ClusterProxy: input.BootstrapClusterProxy,
+			Cluster:      cluster,
+			ModifyMachineDeploymentTopology: func(topology *clusterv1.MachineDeploymentTopology) {
+				topology.Replicas = ptr.To[int32](0)
+			},
+			WaitForMachineDeployments: input.E2EConfig.GetIntervals(specName, "wait-worker-nodes"),
+		})
+
+		By("Verify Node drains for control plane and MachineDeployment Machines are blocked")
+		Eventually(func(g Gomega) {
+			controlPlaneMachines := framework.GetControlPlaneMachinesByCluster(ctx, framework.GetControlPlaneMachinesByClusterInput{
+				Lister:      input.BootstrapClusterProxy.GetClient(),
+				ClusterName: cluster.Name,
+				Namespace:   cluster.Namespace,
+			})
+			var condition *clusterv1.Condition
+			for _, machine := range controlPlaneMachines {
+				condition = conditions.Get(&machine, clusterv1.DrainingSucceededCondition)
+				if condition != nil {
+					// We only expect to find the condition on one Machine (as KCP will only try to drain one Machine at a time)
+					break
+				}
+			}
+			g.Expect(condition).ToNot(BeNil())
+			g.Expect(condition.Status).To(Equal(corev1.ConditionFalse))
+			g.Expect(condition.Message).To(ContainSubstring(fmt.Sprintf("Cannot evict pod as it would violate the pod's disruption budget. The disruption budget %s needs", cpDeploymentAndPDBName)))
+		}, input.E2EConfig.GetIntervals(specName, "wait-machine-deleted")...).Should(Succeed())
+		for _, md := range machineDeployments {
+			Eventually(func(g Gomega) {
+				machines := framework.GetMachinesByMachineDeployments(ctx, framework.GetMachinesByMachineDeploymentsInput{
+					Lister:            input.BootstrapClusterProxy.GetClient(),
+					ClusterName:       cluster.Name,
+					Namespace:         cluster.Namespace,
+					MachineDeployment: *md,
+				})
+				g.Expect(machines).To(HaveLen(1))
+				condition := conditions.Get(&machines[0], clusterv1.DrainingSucceededCondition)
+				g.Expect(condition).ToNot(BeNil())
+				g.Expect(condition.Status).To(Equal(corev1.ConditionFalse))
+				g.Expect(condition.Message).To(ContainSubstring(fmt.Sprintf("Cannot evict pod as it would violate the pod's disruption budget. The disruption budget %s needs", mdDeploymentAndPDBNames[md.Name])))
+			}, input.E2EConfig.GetIntervals(specName, "wait-machine-deleted")...).Should(Succeed())
+		}
+
+		By("Set NodeDrainTimeout to 1s to unblock Node drain")
+		// Note: This also verifies that KCP & MachineDeployments are still propagating changes to NodeDrainTimeout down to
+		// Machines that already have a deletionTimestamp.
+		drainTimeout := &metav1.Duration{Duration: time.Duration(1) * time.Second}
+		modifyControlPlaneViaClusterAndWait(ctx, modifyControlPlaneViaClusterAndWaitInput{
+			ClusterProxy: input.BootstrapClusterProxy,
+			Cluster:      cluster,
+			ModifyControlPlaneTopology: func(topology *clusterv1.ControlPlaneTopology) {
+				topology.NodeDrainTimeout = drainTimeout
+			},
+			WaitForControlPlane: input.E2EConfig.GetIntervals(specName, "wait-control-plane"),
+		})
+		modifyMachineDeploymentViaClusterAndWait(ctx, modifyMachineDeploymentViaClusterAndWaitInput{
+			ClusterProxy: input.BootstrapClusterProxy,
+			Cluster:      cluster,
+			ModifyMachineDeploymentTopology: func(topology *clusterv1.MachineDeploymentTopology) {
+				topology.NodeDrainTimeout = drainTimeout
+			},
+			WaitForMachineDeployments: input.E2EConfig.GetIntervals(specName, "wait-worker-nodes"),
+		})
+
+		By("Verify Node drains were unblocked")
+		// When we scale down the KCP, controlplane machines are deleted one by one, so it requires more time
+		// MD Machine deletion is done in parallel and will be faster.
+		nodeDrainTimeoutKCPInterval := getDrainAndDeleteInterval(input.E2EConfig.GetIntervals(specName, "wait-machine-deleted"), drainTimeout, controlPlaneReplicas)
+		Eventually(func(g Gomega) {
+			// When all drains complete we only have 1 control plane & 0 MD replicas left.
+			controlPlaneMachines := framework.GetControlPlaneMachinesByCluster(ctx, framework.GetControlPlaneMachinesByClusterInput{
+				Lister:      input.BootstrapClusterProxy.GetClient(),
+				ClusterName: cluster.Name,
+				Namespace:   cluster.Namespace,
+			})
+			g.Expect(controlPlaneMachines).To(HaveLen(1))
+
+			for _, md := range machineDeployments {
+				machines := framework.GetMachinesByMachineDeployments(ctx, framework.GetMachinesByMachineDeploymentsInput{
+					Lister:            input.BootstrapClusterProxy.GetClient(),
+					ClusterName:       cluster.Name,
+					Namespace:         cluster.Namespace,
+					MachineDeployment: *md,
+				})
+				g.Expect(machines).To(BeEmpty())
+			}
+		}, nodeDrainTimeoutKCPInterval...).Should(Succeed())
 
 		By("PASSED!")
 	})
